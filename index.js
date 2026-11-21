@@ -343,3 +343,623 @@ app.get("/api/services/mine", authenticate, requireRole("vendor"), async (req, r
 });
 
 app.post("/api/bookings", authenticate, requireRole("customer"), async (req, res) => {
+  if (req.user.role === "admin")
+    return res.status(403).json({ success: false, message: "Admins cannot submit booking requests" });
+  const { serviceId, eventDate, eventLocation, message } = req.body;
+  if (!serviceId || !eventDate || !eventLocation)
+    return res.status(400).json({ success: false, message: "Missing required fields" });
+
+  const service = await findService(serviceId);
+  if (!service || service.status !== "approved" || service.isActive === false) {
+    return res.status(400).json({ success: false, message: "This service is not available for booking" });
+  }
+  if (String(service.vendorId) === String(req.user.id)) {
+    return res.status(400).json({ success: false, message: "You cannot book your own service" });
+  }
+  const parsedEventDate = new Date(req.body.eventDate);
+  if (Number.isNaN(parsedEventDate.getTime()))
+    return res.status(400).json({ success: false, message: "eventDate must be a valid date" });
+
+  const dup = await db.collection("bookings").findOne({
+    serviceId: String(service._id),
+    customerId: String(req.user.id),
+    eventDate,
+    status: "pending",
+  });
+  if (dup)
+    return res.status(409).json({ success: false, message: "You already have a pending request for this service on that date" });
+
+  const { insertedId } = await db.collection("bookings").insertOne({
+    serviceId: String(service._id),
+    vendorId: String(service.vendorId),
+    customerId: String(req.user.id),
+    eventDate,
+    eventLocation: String(req.body.eventLocation).trim(),
+    message: req.body.message ? String(req.body.message).trim() : "",
+    status: "pending",
+    createdAt: now,
+    updatedAt: now,
+  });
+  const bookingDoc = {
+    _id: insertedId,
+    serviceId: String(service._id),
+    vendorId: String(service.vendorId),
+    customerId: String(req.user.id),
+    eventDate,
+    eventLocation: String(req.body.eventLocation).trim(),
+    message: req.body.message ? String(req.body.message).trim() : "",
+    status: "pending",
+    createdAt: now,
+  };
+  res.status(201).json({ success: true, data: { booking: serializeBooking(bookingDoc) }, message: "Booking request submitted" });
+});
+
+app.get("/api/bookings/vendor", authenticate, requireRole("vendor"), async (req, res) => {
+  const page = Math.max(1, Number.parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit) || 12));
+  const skip = (page - 1) * limit;
+  const filter = { vendorId: String(req.user.id) };
+  if (req.query.status) filter.status = req.query.status;
+  const [items, total] = await Promise.all([
+    db.collection("bookings").find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection("bookings").countDocuments(filter),
+  ]);
+  const bookings = await enrichBookings(items);
+  res.json({
+    success: true,
+    data: { bookings, meta: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } },
+  });
+});
+
+const enrichBookings = async (items) =>
+  Promise.all(
+    items.map(async (b) => {
+      const service = await findService(String(b.serviceId));
+      const customer = await findUser(String(b.customerId));
+      return { ...b, id: String(b._id), service, customer };
+    }),
+  );
+
+app.get("/api/bookings/mine", authenticate, requireRole("customer"), async (req, res) => {
+  const page = Math.max(1, Number.parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit) || 12));
+  const skip = (page - 1) * limit;
+  const filter = { customerId: String(req.user.id) };
+  if (req.query.status) filter.status = req.query.status;
+  const [items, total] = await Promise.all([
+    db.collection("bookings").find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection("bookings").countDocuments(filter),
+  ]);
+  res.json({ success: true, data: { bookings: await enrichBookings(items), meta: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } } });
+});
+
+app.patch("/api/bookings/:id/cancel", authenticate, requireRole("customer"), async (req, res) => {
+  const booking = ObjectId.isValid(req.params.id)
+    ? await db.collection("bookings").findOne({ _id: new ObjectId(req.params.id) })
+    : null;
+  if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
+  if (String(booking.customerId) !== String(req.user.id))
+    return res.status(403).json({ success: false, message: "You can only cancel your own bookings" });
+  if (booking.status !== "pending")
+    return res.status(409).json({ success: false, message: `Cannot cancel a booking that is already ${booking.status}` });
+  await db.collection("bookings").updateOne({ _id: booking._id }, { $set: { status: "cancelled", updatedAt: new Date() } });
+  res.json({ success: true, data: { booking: { ...serializeBooking(booking), status: "cancelled" } }, message: "Booking cancelled" });
+});
+
+app.patch("/api/bookings/:id/respond", authenticate, requireRole("vendor"), async (req, res) => {
+  const booking = ObjectId.isValid(req.params.id)
+    ? await db.collection("bookings").findOne({ _id: new ObjectId(req.params.id) })
+    : null;
+  if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
+  if (String(booking.vendorId) !== String(req.user.id))
+    return res.status(403).json({ success: false, message: "You can only manage requests for your own services" });
+  if (booking.status !== "pending")
+    return res.status(409).json({ success: false, message: `This request was already ${booking.status}` });
+  const action = String(req.body.action || "").toLowerCase();
+  if (!["accept", "reject"].includes(action))
+    return res.status(400).json({ success: false, message: 'action must be "accept" or "reject"' });
+  await db.collection("bookings").updateOne({ _id: booking._id }, { $set: { status: action === "accept" ? "accepted" : "rejected", updatedAt: new Date() } });
+  res.json({
+    success: true,
+    data: { booking: { ...serializeBooking(booking), status: action === "accept" ? "accepted" : "rejected" } },
+    message: `Booking ${action}ed`,
+  });
+});
+
+const customerBookingStats = async (customerId) => {
+  const [total, pending, accepted, rejected] = await Promise.all([
+    db.collection("bookings").countDocuments({ customerId: String(customerId) }),
+    db.collection("bookings").countDocuments({ customerId: String(customerId), status: "pending" }),
+    db.collection("bookings").countDocuments({ customerId: String(customerId), status: "accepted" }),
+    db.collection("bookings").countDocuments({ customerId: String(customerId), status: "rejected" }),
+  ]);
+  return { totalBookings: total, pendingBookings: pending, acceptedBookings: accepted, rejectedBookings: rejected };
+};
+
+app.get("/api/admin/stats", authenticate, requireRole("admin"), async (_req, res) => {
+  const [totalUsers, totalVendors, totalCustomers, totalServices, pendingServices, totalTransactions] = await Promise.all([
+    countUsers(),
+    countUsers({ role: "vendor" }),
+    countUsers({ role: "customer" }),
+    db.collection("services").countDocuments(),
+    db.collection("services").countDocuments({ status: "pending" }),
+    db.collection("transactions").countDocuments(),
+  ]);
+  res.json({
+    success: true,
+    data: { totalUsers, totalVendors, totalCustomers, totalServices, pendingServices, totalTransactions },
+  });
+});
+
+app.get("/api/admin/users", authenticate, requireRole("admin"), async (req, res) => {
+  const page = Math.max(1, Number.parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit) || 20));
+  const skip = (page - 1) * limit;
+  const filter = {};
+  if (req.query.role && ["customer", "vendor", "admin"].includes(req.query.role)) filter.role = req.query.role;
+  if (req.query.blocked === "true") filter.isBlocked = true;
+  if (req.query.blocked === "false") filter.isBlocked = false;
+  if (req.query.q || req.query.search) {
+    const esc = escapeRegex(String(req.query.q || req.query.search));
+    filter.$or = [{ name: new RegExp(esc, "i") }, { email: new RegExp(esc, "i") }];
+  }
+  const [items, total] = await Promise.all([
+    db.collection("user").find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection("user").countDocuments(filter),
+  ]);
+  const users = items.map((u) => ({
+    id: String(u._id ?? u.id),
+    name: u.name,
+    email: u.email,
+    image: u.image ?? null,
+    role: u.role ?? "customer",
+    isBlocked: Boolean(u.isBlocked),
+    businessName: u.businessName ?? null,
+    subscriptionPlan: u.subscriptionPlan ?? "free",
+    createdAt: u.createdAt ?? null,
+  }));
+  res.json({ success: true, data: { users, meta: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } } });
+});
+
+app.get("/api/admin/users/:id", authenticate, requireRole("admin"), async (req, res) => {
+  const user = await findUser(req.params.id);
+  if (!user) return res.status(404).json({ success: false, message: "User not found" });
+  const { _id, ...rest } = user;
+  res.json({ success: true, data: { user: { id: String(_id ?? user.id), ...rest } } });
+});
+
+app.patch("/api/admin/users/:id/block", authenticate, requireRole("admin"), async (req, res) => {
+  const user = await findUser(req.params.id);
+  if (!user) return res.status(404).json({ success: false, message: "User not found" });
+  if (String(user._id ?? user.id) === String(req.user.id))
+    return res.status(400).json({ success: false, message: "You cannot block your own account" });
+  if (user.role === "admin")
+    return res.status(400).json({ success: false, message: "Admin accounts cannot be blocked" });
+  const blocked = req.path.endsWith("/block") || req.body.blocked === true;
+  await db.collection("user").updateOne(userQuery(req.params.id), { $set: { isBlocked: blocked, updatedAt: new Date() } });
+  res.json({ success: true, data: { id: req.params.id, isBlocked: blocked }, message: blocked ? "User blocked" : "User unblocked" });
+});
+
+app.patch("/api/admin/users/:id/role", authenticate, requireRole("admin"), async (req, res) => {
+  const target = await findUser(req.params.id);
+  if (!target) return res.status(404).json({ success: false, message: "User not found" });
+  const targetId = String(target._id ?? target.id);
+  if (targetId === String(req.user.id))
+    return res.status(400).json({ success: false, message: "You cannot change your own role" });
+  const role = String(req.body.role ?? "");
+  if (!["customer", "vendor", "admin"].includes(role))
+    return res.status(400).json({ success: false, message: 'role must be one of "customer", "vendor", "admin"' });
+  const current = target.role ?? "customer";
+  if (current === role)
+    return res.json({ success: true, data: { id: targetId, role }, message: "Role unchanged" });
+  if (current === "admin") {
+    const admins = await countUsers({ role: "admin" });
+    if (admins <= 1)
+      return res.status(409).json({ success: false, message: "Cannot demote the last remaining admin" });
+  }
+  await db.collection("user").updateOne(userQuery(targetId), { $set: { role, updatedAt: new Date() } });
+  res.json({ success: true, data: { id: targetId, role }, message: `Role updated to ${role}` });
+});
+
+app.delete("/api/admin/users/:id", authenticate, requireRole("admin"), async (req, res) => {
+  const target = await findUser(req.params.id);
+  if (!target) return res.status(404).json({ success: false, message: "User not found" });
+  const targetId = String(target._id ?? target.id);
+  if (targetId === String(req.user.id))
+    return res.status(400).json({ success: false, message: "You cannot delete your own account" });
+  if ((target.role ?? "customer") === "admin") {
+    const admins = await countUsers({ role: "admin" });
+    if (admins <= 1)
+      return res.status(409).json({ success: false, message: "Cannot delete the last remaining admin" });
+  }
+  const idStr = String(target._id ?? target.id);
+  const ids = [idStr];
+  if (ObjectId.isValid(idStr)) ids.push(new ObjectId(idStr));
+  await Promise.all([
+    db.collection("user").deleteOne(userQuery(targetId)),
+    db.collection("session").deleteMany({ userId: { $in: ids } }),
+    db.collection("account").deleteMany({ userId: { $in: ids } }),
+    db.collection("verification").deleteMany({ identifier: target.email }),
+  ]);
+  res.json({ success: true, data: { id: targetId }, message: "User deleted permanently" });
+});
+
+app.get("/api/admin/services", authenticate, requireRole("admin"), async (req, res) => {
+  const page = Math.max(1, Number.parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit) || 12));
+  const { items, total } = await findServicesFiltered({
+    approvedOnly: false,
+    query: req.query.q,
+    category: req.query.category,
+    location: req.query.location,
+    status: req.query.status,
+    sort: req.query.sort ? (() => {
+      const s = String(req.query.sort).toLowerCase();
+      if (s === "price:asc") return { price: 1 };
+      if (s === "price:desc") return { price: -1 };
+      if (s === "createdat:asc") return { createdAt: 1 };
+      return { createdAt: -1 };
+    })() : { createdAt: -1 },
+    skip: (page - 1) * limit,
+    limit,
+  });
+  res.json({
+    success: true,
+    data: { services: items, meta: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } },
+  });
+});
+
+app.patch("/api/admin/services/:id/status", authenticate, requireRole("admin"), async (req, res) => {
+  const service = ObjectId.isValid(req.params.id)
+    ? await db.collection("services").findOne({ _id: new ObjectId(req.params.id) })
+    : null;
+  if (!service) return res.status(404).json({ success: false, message: "Service not found" });
+  const status = String(req.body.status || "");
+  if (!["approved", "rejected"].includes(status))
+    return res.status(400).json({ success: false, message: 'status must be "approved" or "rejected"' });
+  const updatedAt = new Date();
+  await db.collection("services").updateOne(
+    { _id: service._id },
+    { $set: { status, isActive: status === "approved" ? true : Boolean(service.isActive), updatedAt } },
+  );
+  res.json({
+    success: true,
+    data: { service: serializeService(await findService(service._id)) },
+    message: `Service ${status}`,
+  });
+});
+
+app.get("/api/admin/transactions", authenticate, requireRole("admin"), async (req, res) => {
+  const page = Math.max(1, Number.parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit) || 20));
+  const skip = (page - 1) * limit;
+  const [items, total] = await Promise.all([
+    db.collection("transactions").find().sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection("transactions").countDocuments(),
+  ]);
+  const vendorIds = [...new Set(items.map((t) => String(t.vendorId)))];
+  const userDocs = vendorIds.length
+    ? await db.collection("user").find({ $or: vendorIds.flatMap((id) => [{ _id: id }, ...(ObjectId.isValid(id) ? [{ _id: new ObjectId(id) }] : []), { id }]) }).toArray()
+    : [];
+  const userMap = new Map(userDocs.map((u) => [String(u._id ?? u.id), u]));
+  const transactions = items.map((t) => {
+    const u = userMap.get(String(t.vendorId));
+    return { ...t, id: String(t._id), vendor: u ? { id: String(u._id ?? u.id), name: u.name, email: u.email, businessName: u.businessName ?? null } : null };
+  });
+  res.json({ success: true, data: { transactions, meta: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } });
+});
+
+// --- Subscriptions & Stripe ---
+app.get("/api/subscriptions/plans", (_req, res) => {
+  res.json({
+    success: true,
+    data: {
+      plans: [
+        { id: "free", name: "Free", price: 0, currency: stripeConfig.premiumCurrency, features: ["Up to 6 active services", "Basic vendor dashboard", "Booking request management"] },
+        { id: "premium", name: "Premium (15 days)", price: stripeConfig.premiumAmount / 100, currency: stripeConfig.premiumCurrency, days: stripeConfig.premiumDurationDays, features: ["Unlimited active services", "Premium vendor badge", "Everything in Free"] },
+      ],
+    },
+  });
+});
+
+app.get("/api/subscriptions/status", authenticate, requireRole("vendor"), (req, res) => {
+  res.json({
+    success: true,
+    data: { plan: req.user.subscriptionPlan, subscriptionExpiresAt: req.user.subscriptionExpiresAt, isPremium: isPremiumUser(req.user) },
+  });
+});
+
+app.post("/api/subscriptions/checkout", authenticate, requireRole("vendor"), async (req, res) => {
+  if (!stripe) return res.status(501).json({ success: false, message: "Stripe is not configured on this server" });
+  if (req.body.vendorId && String(req.body.vendorId) !== String(req.user.id))
+    return res.status(403).json({ success: false, message: "You cannot create a subscription for another vendor" });
+  const vendorId = String(req.user.id);
+  const planType = req.body.planType || "premium";
+  const planKey = "premium";
+  const success_url = `http://localhost:3000/payment/success?session_id={CHECKOUT_SESSION_ID}`;
+  const cancel_url = `http://localhost:3000/payment/cancel`;
+  const params = {
+    mode: stripeConfig.priceId ? "subscription" : "payment",
+    success_url: success_url,
+    cancel_url: cancel_url,
+    client_reference_id: vendorId,
+    metadata: { vendorId, planType },
+    ...(req.user.email ? { customer_email: req.user.email } : {}),
+    line_items: [
+      stripeConfig.priceId
+        ? { price: stripeConfig.priceId }
+        : {
+            price_data: {
+              currency: stripeConfig.premiumCurrency,
+              unit_amount: stripeConfig.premiumAmount,
+              product_data: { name: `WedPlan Premium (${stripeConfig.premiumDurationDays} days)`, metadata: { vendorId, planType } },
+            },
+            quantity: 1,
+          },
+    ],
+  };
+  const session = await stripe.checkout.sessions.create(params);
+  res.json({ success: true, data: { url: session.url, sessionId: session.id } });
+});
+
+app.post("/api/subscriptions/checkout-verify", authenticate, requireRole("vendor"), async (req, res) => {
+  if (!stripe) return res.status(501).json({ success: false, message: "Stripe is not configured on this server" });
+  const { sessionId } = req.body;
+  if (!sessionId) return res.json({ success: false, message: "Session ID is required" });
+  const session = await stripe.checkout.sessions.retrieve(sessionId);
+  if (session.status !== "complete" || session.payment_status !== "paid") {
+    return res.json({ success: false, message: "Payment verification failed" });
+  }
+  const vendorId = session.metadata?.vendorId || session.client_reference_id;
+  const planType = session.metadata?.planType || "premium";
+  if (!vendorId) return res.status(400).json({ success: false, message: "No vendorId on the Stripe session" });
+  if (String(vendorId) !== String(req.user.id))
+    return res.status(403).json({ success: false, message: "You cannot verify a payment for another vendor" });
+  
+  // Preserve existing plan duration if user already has a plan that expires later
+  const existingUser = await findUser(vendorId);
+  const existingExpiresAt = existingUser.subscriptionExpiresAt ? new Date(existingUser.subscriptionExpiresAt) : null;
+  const newExpiresAt = new Date(Date.now() + stripeConfig.premiumDurationDays * 24 * 60 * 60 * 1000);
+  const expiresAt = existingExpiresAt && existingExpiresAt > newExpiresAt ? existingExpiresAt : newExpiresAt;
+  
+  const planKey = "premium";
+  await db.collection("transactions").insertOne({
+    vendorId: String(vendorId),
+    plan: planType,
+    amount: (session.amount_total ?? stripeConfig.premiumAmount) / 100,
+    currency: session.currency ?? stripeConfig.premiumCurrency,
+    stripeSessionId: sessionId,
+    stripeSubscriptionId: typeof session.subscription === "string" ? session.subscription : null,
+    stripeEventId: `checkout-${sessionId}`,
+    status: "succeeded",
+    createdAt: new Date(),
+  });
+  await db.collection("user").updateOne(userQuery(vendorId), { $set: { subscriptionPlan: planType, subscriptionExpiresAt: expiresAt, updatedAt: new Date() } });
+  res.json({ success: true, data: { verified: true, plan: planType, expiresAt }, message: "Payment verified" });
+});
+
+
+async function handleStripeWebhook(req, res) {
+  if (!Buffer.isBuffer(req.body)) return res.status(400).json({ success: false, message: "Expected raw body" });
+  try {
+    if (!verifyStripeSignature(req.body, req.headers["stripe-signature"])) {
+      return res.status(400).json({ success: false, message: "Invalid Stripe webhook signature" });
+    }
+  } catch (err) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+  const event = JSON.parse(req.body.toString("utf8"));
+  const object = event?.data?.object ?? {};
+  if (event.type === "checkout.session.completed") {
+    const vendorId = object.metadata?.vendorId || object.client_reference_id;
+    const planType = "premium";
+    if (vendorId) {
+      // Preserve existing plan duration if user already has a plan that expires later
+      const existingUser = await findUser(vendorId);
+      const existingExpiresAt = existingUser.subscriptionExpiresAt ? new Date(existingUser.subscriptionExpiresAt) : null;
+      const newExpiresAt = new Date(Date.now() + stripeConfig.premiumDurationDays * 24 * 60 * 60 * 1000);
+      const expiresAt = existingExpiresAt && existingExpiresAt > newExpiresAt ? existingExpiresAt : newExpiresAt;
+      
+      const existing = await db.collection("transactions").findOne({ stripeEventId: event.id });
+      if (!existing) {
+        await db.collection("transactions").insertOne({
+          vendorId: String(vendorId),
+          plan: planType,
+          amount: (object.amount_total ?? stripeConfig.premiumAmount) / 100,
+          currency: object.currency ?? stripeConfig.premiumCurrency,
+          stripeSessionId: object.id,
+          stripeSubscriptionId: typeof object.subscription === "string" ? object.subscription : null,
+          stripeEventId: event.id,
+          status: "succeeded",
+          createdAt: new Date(),
+        });
+        await db.collection("user").updateOne(userQuery(vendorId), { $set: { subscriptionPlan: planType, subscriptionExpiresAt: expiresAt, updatedAt: new Date() } });
+      }
+    }
+  } else if (event.type === "customer.subscription.deleted") {
+    await db.collection("transactions").updateMany({ stripeSubscriptionId: object.id }, { $set: { status: "cancelled" } });
+    await db.collection("user").updateMany({ stripeSubscriptionId: object.id }, { $set: { subscriptionPlan: "free", subscriptionExpiresAt: null, updatedAt: new Date() } });
+  } else if (event.type === "invoice.payment_failed") {
+    if (typeof object.subscription === "string")
+      await db.collection("transactions").updateMany({ stripeSubscriptionId: object.subscription }, { $set: { status: "failed" } });
+  }
+  res.json({ success: true, data: { received: true } });
+}
+
+
+async function seedSampleData() {
+  const now = new Date();
+
+  // Check if sample data has already been seeded — prevent re-creation after deletion
+  const existingConfig = await db.collection("config").findOne({ _id: "sampleData" });
+  if (existingConfig && existingConfig.seeded) {
+    // Sample data already seeded; ensure vendor/customer IDs are still available
+    const vendor = await db.collection("user").findOne({ email: "sample-vendor@wedplan.test" });
+    const customer = await db.collection("user").findOne({ email: "sample.customer@wedplan.app" });
+    if (!vendor || !customer) {
+      // Config says seeded but users are missing — re-seed them
+      // Fall through to re-creation below
+    } else {
+      // Users exist and config is set — we're done; still need to ensure services/bookings
+      const sampleService = await db.collection("services").findOne({ vendorId: vendor._id, status: "approved" });
+      if (sampleService) {
+        const existingBooking = await db.collection("bookings").findOne({ serviceId: String(sampleService._id), customerId: customer._id, status: "pending" });
+        if (!existingBooking) {
+          await db.collection("bookings").insertOne({
+            serviceId: String(sampleService._id),
+            vendorId: String(vendor._id),
+            customerId: customer._id,
+            eventDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+            eventLocation: sampleService.location,
+            message: "Congratulations! Excited to celebrate this milestone with you.",
+            status: "pending",
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+      }
+      return;
+    }
+  }
+
+  const vendorEmail = "sample-vendor@wedplan.test";
+  let vendor = await db.collection("user").findOne({ email: vendorEmail });
+  let vendorId;
+  if (!vendor) {
+    const { insertedId } = await db.collection("user").insertOne({
+      name: "Sample Vendor",
+      email: vendorEmail,
+      image: null,
+      role: "vendor",
+      businessName: "WedPlan Wedding Studio",
+      subscriptionPlan: "premium",
+      subscriptionExpiresAt: new Date(Date.now() + PREMIUM_DURATION_DAYS * 24 * 60 * 60 * 1000),
+      isBlocked: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+    vendorId = String(insertedId);
+  } else {
+    vendorId = String(vendor._id ?? vendor.id);
+  }
+
+
+  // catalog entry that is missing from the marketplace ---
+  const catalogDocs = await serviceCatalog.find().toArray();
+  const existingServiceNames = new Set(
+    (await db.collection("services").find({ vendorId }).project({ serviceName: 1 }).toArray()).map((s) => s.serviceName),
+  );
+  for (const entry of catalogDocs) {
+    if (existingServiceNames.has(entry.serviceName)) continue;
+    await db.collection("services").insertOne({
+      vendorId,
+      serviceName: entry.serviceName,
+      category: entry.category,
+      description: entry.description,
+      price: entry.price,
+      location: entry.location,
+      images: entry.images ?? [],
+      vendorSnapshot: {
+        name: vendor?.name ?? "Sample Vendor",
+        businessName: vendor?.businessName ?? null,
+        image: vendor?.image ?? null,
+      },
+      status: "approved",
+      isActive: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    existingServiceNames.add(entry.serviceName);
+  }
+
+  const customerEmail = "sample.customer@wedplan.app";
+  let customer = await db.collection("user").findOne({ email: customerEmail });
+  let customerId;
+  if (!customer) {
+    const { insertedId } = await db.collection("user").insertOne({
+      name: "Sample Customer",
+      email: customerEmail,
+      image: null,
+      role: "customer",
+      isBlocked: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+    customerId = String(insertedId);
+  } else {
+    customerId = String(customer._id ?? customer.id);
+  }
+
+  const sampleService = await db.collection("services").findOne({ vendorId, status: "approved" });
+  if (sampleService) {
+    const existingBooking = await db
+      .collection("bookings")
+      .findOne({ serviceId: String(sampleService._id), customerId, status: "pending" });
+    if (!existingBooking) {
+      await db.collection("bookings").insertOne({
+        serviceId: String(sampleService._id),
+        vendorId,
+        customerId,
+        eventDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        eventLocation: sampleService.location,
+        message: "Congratulations! Excited to celebrate this milestone with you.",
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+  }
+
+  await db.collection("config").updateOne(
+    { _id: "sampleData" },
+    { $set: { seeded: true } },
+    { upsert: true },
+  );
+}
+
+async function seedAdmin() {
+  const email = process.env.ADMIN_SEED_EMAIL;
+  if (!email) throw new Error("ADMIN_SEED_EMAIL must be set to seed an admin user");
+  const now = new Date();
+  const existing = await db.collection("user").findOne({ email });
+  if (!existing) {
+    await db.collection("user").insertOne({
+      name: "WedPlan Admin",
+      email,
+      image: null,
+      role: "admin",
+      isBlocked: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+    console.log(`Admin user seeded for ${email}`);
+    return;
+  }
+  await db.collection("user").updateOne(userQuery(String(existing._id ?? existing.id)), { $set: { role: "admin", updatedAt: now } });
+  console.log(`Admin ensured for ${email}`);
+}
+
+async function main() {
+  if (process.argv.includes("--seed")) { await seedSampleData(); process.exit(0); }
+  if (process.argv.includes("--seed-admin")) { await seedAdmin(); process.exit(0); }
+  server = app.listen(port, () => console.log(`WedPlan Server is Running on port ${port}`));
+}
+
+main().catch((err) => {
+  console.error("[fatal]", err);
+  process.exit(1);
+});
+
+const shutdown = async (signal) => {
+  console.log(`\n[server] ${signal} received — shutting down`);
+  try {
+    if (server) await new Promise((r) => server.close(r));
+    await client.close();
+    process.exit(0);
+  } catch (err) {
+    console.error("[server] error during shutdown:", err);
+    process.exit(1);
+  }
+};
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
