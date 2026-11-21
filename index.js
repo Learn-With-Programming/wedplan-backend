@@ -77,6 +77,8 @@ const findService = (id) =>
     ? db.collection("services").findOne({ _id: new ObjectId(id) })
     : null;
 
+const serializeCatalogEntry = (e) => e && { ...e, id: String(e._id) };
+
 const verifyStripeSignature = (rawBody, signatureHeader) => {
   const parts = String(signatureHeader || "")
     .split(",")
