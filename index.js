@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
+import crypto from "node:crypto";
+import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -34,3 +36,5 @@ const services = db.collection("services");
 const bookings = db.collection("bookings");
 const transactions = db.collection("transactions");
 const serviceCatalog = db.collection("serviceCatalog");
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
