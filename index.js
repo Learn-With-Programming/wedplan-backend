@@ -79,6 +79,9 @@ const findService = (id) =>
 
 const serializeCatalogEntry = (e) => e && { ...e, id: String(e._id) };
 
+const serializeService = (s) =>
+  s && { ...s, id: String(s._id) };
+
 const verifyStripeSignature = (rawBody, signatureHeader) => {
   const parts = String(signatureHeader || "")
     .split(",")
@@ -224,7 +227,113 @@ app.delete("/api/services/catalog/:id", authenticate, requireRole("admin"), asyn
   res.json({ success: true, message: "Catalog entry deleted" });
 });
 
-app.get("/api/services/meta", (req, res) => {
+app.get("/api/services", async (req, res) => {
+  const page = Math.max(1, Number.parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit) || 12));
+  const skip = (page - 1) * limit;
+  const filter = { status: "approved", isActive: true };
+  if (req.query.category) filter.category = req.query.category;
+  if (req.query.location) filter.location = req.query.location;
+  if (req.query.status) filter.status = req.query.status;
+  if (req.query.q) {
+    const esc = escapeRegex(String(req.query.q));
+    filter.$or = [
+      { serviceName: new RegExp(esc, "i") },
+      { description: new RegExp(esc, "i") },
+    ];
+  }
+  const sortSpec =
+    req.query.sort === "price:asc"
+      ? { price: 1 }
+      : req.query.sort === "price:desc"
+        ? { price: -1 }
+        : { createdAt: -1 };
+  const [items, total] = await Promise.all([
+    db.collection("services")
+      .find(filter)
+      .sort(sortSpec)
+      .skip(skip)
+      .limit(limit)
+      .toArray(),
+    db.collection("services").countDocuments(filter),
+  ]);
+  res.json({
+    success: true,
+    data: {
+      services: items.map(serializeService),
+      meta: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+    },
+  });
+});
+
+app.get("/api/services/:id", async (req, res) => {
+  const service = await findService(req.params.id);
+  if (!service || service.status !== "approved" || service.isActive === false) {
+    return res
+      .status(404)
+      .json({ success: false, message: "Service not found or not available" });
+  }
+  res.json({ success: true, data: { service: serializeService(service) } });
+});
+
+app.post("/api/services", authenticate, requireRole("vendor"), async (req, res) => {
+  const { serviceName, category, description, price, location } = req.body;
+  if (!serviceName || !category || !description || !price || !location) {
+    return res.status(400).json({ success: false, message: "Missing required fields" });
+  }
+  const categories = CATEGORIES;
+  if (!categories.includes(category)) {
+    return res.status(400).json({ success: false, message: "Invalid category" });
+  }
+  const numericPrice = Number(price);
+  if (!Number.isFinite(numericPrice) || numericPrice < 0) {
+    return res.status(400).json({ success: false, message: "price must be a non-negative number" });
+  }
+
+  const isPremiumUser = (u) => u?.subscriptionPlan === "premium" && (!u.subscriptionExpiresAt || new Date(u.subscriptionExpiresAt) > new Date());
+
+if (!isPremiumUser(req.user)) {
+    const count = await db
+      .collection("services")
+      .countDocuments({ vendorId: String(req.user.id), isActive: true, status: { $ne: "rejected" } });
+    if (count >= 6) {
+      return res
+        .status(403)
+        .json({
+          success: false,
+          message: "Free plan allows a maximum of 6 active services. Upgrade to Premium (15 days) for more services.",
+        });
+    }
+  }
+
+  const images = Array.isArray(req.body.images)
+    ? req.body.images.filter((u) => typeof u === "string" && u.trim())
+    : [];
+  const now = new Date();
+  const { insertedId } = await db.collection("services").insertOne({
+    vendorId: String(req.user.id),
+    serviceName: String(serviceName).trim(),
+    category,
+    description: String(description).trim(),
+    price: numericPrice,
+    location: String(location).trim(),
+    images,
+    vendorSnapshot: {
+      name: req.user.name,
+      businessName: req.user.businessName ?? null,
+      image: req.user.image ?? null,
+    },
+    status: "pending",
+    isActive: true,
+    createdAt: now,
+    updatedAt: now,
+  });
+  res
+    .status(201)
+    .json({ success: true, data: { service: serializeService(await findService(insertedId)) }, message: "Service submitted for review" });
+});
+
+app.get("/api/services/mine", authenticate, requireRole("vendor"), async (req, res) => {
   res.json({
     success: true,
     data: {
