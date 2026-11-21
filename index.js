@@ -58,4 +58,43 @@ async function verifyJwt(token) {
   const userId = claims.sub || claims.userId || claims.id;
   if (!userId) throw new Error("Token is missing the subject");
   return { userId: String(userId) };
-}
+};
+
+const verifyStripeSignature = (rawBody, signatureHeader) => {
+  const parts = String(signatureHeader || "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const timestampPart = parts.find((p) => p.startsWith("t="));
+  const signaturePart = parts.find((p) => p.startsWith("v1="));
+  if (!timestampPart || !signaturePart) return false;
+  const timestamp = Number(timestampPart.slice(2));
+  if (!Number.isFinite(timestamp) || Math.abs(Date.now() / 1000 - timestamp) > 300)
+    return false;
+  const expected = crypto
+    .createHmac("sha256", process.env.STRIPE_SECRET_KEY)
+    .update(rawBody)
+    .digest("hex");
+  const provided = signaturePart.slice(3);
+  const a = Buffer.from(expected, "hex");
+  const b = Buffer.from(provided, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+};
+
+const userQuery = (id) => {
+  const clauses = [{ _id: id }, { id }];
+  if (ObjectId.isValid(id)) clauses.push({ _id: new ObjectId(id) });
+  return { $or: clauses };
+};
+
+const requireRole = (...roles) => (req, res, next) => {
+  if (!req.user)
+    return res
+      .status(401)
+      .json({ success: false, message: "Authentication required" });
+  if (!roles.includes(req.user.role))
+    return res
+      .status(403)
+      .json({ success: false, message: "Forbidden" });
+  next();
+};
