@@ -341,3 +341,5 @@ app.get("/api/services/mine", authenticate, requireRole("vendor"), async (req, r
     },
   });
 });
+
+app.post("/api/bookings", authenticate, requireRole("customer"), async (req, res) => {
