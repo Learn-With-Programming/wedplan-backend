@@ -60,6 +60,23 @@ async function verifyJwt(token) {
   return { userId: String(userId) };
 };
 
+const CATEGORIES = [
+  "Photography & Videography",
+  "Wedding Venues",
+  "Decoration & Florist",
+  "Catering Services",
+  "Makeup & Styling",
+  "Wedding Fashion",
+];
+
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const findUser = (id) => db.collection("user").findOne(userQuery(String(id)));
+const countUsers = (filter = {}) => db.collection("user").countDocuments(filter);
+const findService = (id) =>
+  ObjectId.isValid(id)
+    ? db.collection("services").findOne({ _id: new ObjectId(id) })
+    : null;
+
 const verifyStripeSignature = (rawBody, signatureHeader) => {
   const parts = String(signatureHeader || "")
     .split(",")
