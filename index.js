@@ -113,5 +113,120 @@ const requireRole = (...roles) => (req, res, next) => {
     return res
       .status(403)
       .json({ success: false, message: "Forbidden" });
-  next();
-};
+  app.get("/api/services/meta", (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      categories: CATEGORIES,
+    },
+  });
+});
+
+app.get("/api/services/catalog", authenticate, requireRole("admin"), async (req, res) => {
+  const page = Math.max(1, Number.parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit) || 25));
+  const skip = (page - 1) * limit;
+  const filter = {};
+  if (req.query.q) filter.serviceName = new RegExp(escapeRegex(String(req.query.q)), "i");
+  const [items, total] = await Promise.all([
+    serviceCatalog.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    serviceCatalog.countDocuments(filter),
+  ]);
+  res.json({
+    success: true,
+    data: {
+      entries: items.map(serializeCatalogEntry),
+      meta: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+    },
+  });
+});
+
+app.get("/api/services/catalog/:id", authenticate, requireRole("admin"), async (req, res) => {
+  const entry = ObjectId.isValid(req.params.id)
+    ? await serviceCatalog.findOne({ _id: new ObjectId(req.params.id) })
+    : null;
+  if (!entry) return res.status(404).json({ success: false, message: "Catalog entry not found" });
+  res.json({ success: true, data: { entry: serializeCatalogEntry(entry) } });
+});
+
+app.post("/api/services/catalog", authenticate, requireRole("admin"), async (req, res) => {
+  const body = req.body ?? {};
+  if (!body.serviceName || !body.category || !body.description || body.price === undefined || !body.location) {
+    return res.status(400).json({ success: false, message: "Missing required fields" });
+  }
+  if (!CATEGORIES.includes(body.category)) {
+    return res.status(400).json({ success: false, message: "Invalid category" });
+  }
+  const numericPrice = Number(body.price);
+  if (!Number.isFinite(numericPrice) || numericPrice < 0) {
+    return res.status(400).json({ success: false, message: "price must be a non-negative number" });
+  }
+  const images = Array.isArray(body.images)
+    ? body.images.filter((u) => typeof u === "string" && u.trim())
+    : [];
+  const now = new Date();
+  const { insertedId } = await serviceCatalog.insertOne({
+    serviceName: String(body.serviceName).trim(),
+    category: body.category,
+    description: String(body.description).trim(),
+    price: numericPrice,
+    location: String(body.location).trim(),
+    images,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const entry = await serviceCatalog.findOne({ _id: insertedId });
+  res.status(201).json({ success: true, data: { entry: serializeCatalogEntry(entry) }, message: "Catalog entry created" });
+});
+
+app.patch("/api/services/catalog/:id", authenticate, requireRole("admin"), async (req, res) => {
+  const entry = ObjectId.isValid(req.params.id)
+    ? await serviceCatalog.findOne({ _id: new ObjectId(req.params.id) })
+    : null;
+  if (!entry) return res.status(404).json({ success: false, message: "Catalog entry not found" });
+  const patch = {};
+  if (req.body.serviceName !== undefined) patch.serviceName = String(req.body.serviceName).trim();
+  if (req.body.description !== undefined) patch.description = String(req.body.description).trim();
+  if (req.body.location !== undefined) patch.location = String(req.body.location).trim();
+  if (req.body.category !== undefined) {
+    if (!CATEGORIES.includes(req.body.category)) return res.status(400).json({ success: false, message: "Invalid category" });
+    patch.category = req.body.category;
+  }
+  if (req.body.price !== undefined) {
+    const numericPrice = Number(req.body.price);
+    if (!Number.isFinite(numericPrice) || numericPrice < 0) {
+      return res.status(400).json({ success: false, message: "price must be a non-negative number" });
+    }
+    patch.price = numericPrice;
+  }
+  if (req.body.images !== undefined) {
+    if (!Array.isArray(req.body.images)) return res.status(400).json({ success: false, message: "images must be an array" });
+    patch.images = req.body.images.filter((u) => typeof u === "string" && u.trim());
+  }
+  if (Object.keys(patch).length > 0) {
+    await serviceCatalog.updateOne({ _id: entry._id }, { $set: { ...patch, updatedAt: new Date() } });
+  }
+  res.json({
+    success: true,
+    data: { entry: serializeCatalogEntry(await serviceCatalog.findOne({ _id: entry._id })) },
+    message: "Catalog entry updated",
+  });
+});
+
+app.delete("/api/services/catalog/:id", authenticate, requireRole("admin"), async (req, res) => {
+  const entry = ObjectId.isValid(req.params.id)
+    ? await serviceCatalog.findOne({ _id: new ObjectId(req.params.id) })
+    : null;
+  if (!entry) return res.status(404).json({ success: false, message: "Catalog entry not found" });
+  await serviceCatalog.deleteOne({ _id: entry._id });
+  res.json({ success: true, message: "Catalog entry deleted" });
+});
+
+app.get("/api/services/meta", (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      categories: CATEGORIES,
+    },
+  });
+});
