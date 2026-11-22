@@ -93,9 +93,56 @@ const findService = (id) =>
     ? db.collection("services").findOne({ _id: new ObjectId(id) })
     : null;
 
+const resolveServiceSort = (sort) => {
+  if (sort && typeof sort === "object") return sort;
+  const s = String(sort || "").toLowerCase();
+  if (s === "price:asc") return { price: 1 };
+  if (s === "price:desc") return { price: -1 };
+  if (s === "createdat:asc") return { createdAt: 1 };
+  return { createdAt: -1 };
+};
+
+const findServicesFiltered = async ({
+  approvedOnly = false,
+  query,
+  category,
+  location,
+  status,
+  sort,
+  skip = 0,
+  limit = 12,
+}) => {
+  const filter = {};
+  if (approvedOnly) filter.status = "approved";
+  if (status) filter.status = status;
+  if (category) filter.category = category;
+  if (location) filter.location = location;
+  if (query) {
+    const esc = escapeRegex(String(query));
+    filter.$or = [
+      { serviceName: new RegExp(esc, "i") },
+      { description: new RegExp(esc, "i") },
+    ];
+  }
+  const sortSpec = resolveServiceSort(sort);
+  const [items, total] = await Promise.all([
+    db
+      .collection("services")
+      .find(filter)
+      .sort(sortSpec)
+      .skip(skip)
+      .limit(limit)
+      .toArray(),
+    db.collection("services").countDocuments(filter),
+  ]);
+  return { items: items.map(serializeService), total };
+};
+
 const serializeCatalogEntry = (e) => e && { ...e, id: String(e._id) };
 
 const serializeService = (s) => s && { ...s, id: String(s._id) };
+
+const serializeBooking = (b) => b && { ...b, id: String(b._id ?? b.id) };
 
 const verifyStripeSignature = (rawBody, signatureHeader) => {
   const parts = String(signatureHeader || "")
@@ -449,6 +496,23 @@ app.get("/api/services/meta", (req, res) => {
       });
     });
 
+    app.get(
+      "/api/services/mine",
+      authenticate,
+      requireRole("vendor"),
+      async (req, res) => {
+        const items = await db
+          .collection("services")
+          .find({ vendorId: String(req.user.id) })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.json({
+          success: true,
+          data: { services: items.map(serializeService), categories: CATEGORIES },
+        });
+      },
+    );
+
     app.get("/api/services/:id", async (req, res) => {
       const service = await findService(req.params.id);
       if (
@@ -465,6 +529,100 @@ app.get("/api/services/meta", (req, res) => {
       }
       res.json({ success: true, data: { service: serializeService(service) } });
     });
+
+    app.patch(
+      "/api/services/:id",
+      authenticate,
+      requireRole("vendor", "admin"),
+      async (req, res) => {
+        const service = await findService(req.params.id);
+        if (!service)
+          return res
+            .status(404)
+            .json({ success: false, message: "Service not found" });
+        if (
+          req.user.role === "vendor" &&
+          String(service.vendorId) !== String(req.user.id)
+        )
+          return res.status(403).json({
+            success: false,
+            message: "You can only edit your own services",
+          });
+
+        const patch = {};
+        if (req.body.serviceName !== undefined)
+          patch.serviceName = String(req.body.serviceName).trim();
+        if (req.body.category !== undefined) {
+          if (!CATEGORIES.includes(req.body.category))
+            return res
+              .status(400)
+              .json({ success: false, message: "Invalid category" });
+          patch.category = req.body.category;
+        }
+        if (req.body.description !== undefined)
+          patch.description = String(req.body.description).trim();
+        if (req.body.location !== undefined)
+          patch.location = String(req.body.location).trim();
+        if (req.body.price !== undefined) {
+          const price = Number(req.body.price);
+          if (!Number.isFinite(price) || price < 0)
+            return res.status(400).json({
+              success: false,
+              message: "price must be a non-negative number",
+            });
+          patch.price = price;
+        }
+        if (req.body.images !== undefined) {
+          if (!Array.isArray(req.body.images))
+            return res
+              .status(400)
+              .json({ success: false, message: "images must be an array" });
+          patch.images = req.body.images.filter(
+            (u) => typeof u === "string" && u.trim(),
+          );
+        }
+        if (req.body.isActive !== undefined)
+          patch.isActive = Boolean(req.body.isActive);
+        // Major edits go back through admin review.
+        if (req.body.resubmit === true) patch.status = "pending";
+        patch.updatedAt = new Date();
+
+        await db
+          .collection("services")
+          .updateOne({ _id: service._id }, { $set: patch });
+        res.json({
+          success: true,
+          data: { service: serializeService(await findService(service._id)) },
+          message: "Service updated",
+        });
+      },
+    );
+
+    app.delete(
+      "/api/services/:id",
+      authenticate,
+      requireRole("vendor", "admin"),
+      async (req, res) => {
+        const service = await findService(req.params.id);
+        if (!service)
+          return res
+            .status(404)
+            .json({ success: false, message: "Service not found" });
+        if (
+          req.user.role === "vendor" &&
+          String(service.vendorId) !== String(req.user.id)
+        )
+          return res.status(403).json({
+            success: false,
+            message: "You can only delete your own services",
+          });
+        await db.collection("services").deleteOne({ _id: service._id });
+        await db
+          .collection("bookings")
+          .deleteMany({ serviceId: String(service._id) });
+        res.json({ success: true, message: "Service deleted" });
+      },
+    );
 
     app.post(
       "/api/services",
@@ -548,20 +706,6 @@ app.get("/api/services/meta", (req, res) => {
       },
     );
 
-    app.get(
-      "/api/services/mine",
-      authenticate,
-      requireRole("vendor"),
-      async (req, res) => {
-        res.json({
-          success: true,
-          data: {
-            categories: CATEGORIES,
-          },
-        });
-      },
-    );
-
     app.post(
       "/api/bookings",
       authenticate,
@@ -609,6 +753,8 @@ app.get("/api/services/meta", (req, res) => {
               success: false,
               message: "eventDate must be a valid date",
             });
+
+        const now = new Date();
 
         const dup = await db.collection("bookings").findOne({
           serviceId: String(service._id),
@@ -879,6 +1025,56 @@ app.get("/api/services/meta", (req, res) => {
       };
     };
 
+    const vendorStats = async (vendorId) => {
+      const [totalServices, activeServices, pendingRequests, acceptedBookings] =
+        await Promise.all([
+          db.collection("services").countDocuments({ vendorId: String(vendorId) }),
+          db.collection("services").countDocuments({
+            vendorId: String(vendorId),
+            status: "approved",
+            isActive: true,
+          }),
+          db.collection("bookings").countDocuments({
+            vendorId: String(vendorId),
+            status: "pending",
+          }),
+          db.collection("bookings").countDocuments({
+            vendorId: String(vendorId),
+            status: "accepted",
+          }),
+        ]);
+      return { totalServices, activeServices, pendingRequests, acceptedBookings };
+    };
+
+    app.get(
+      "/api/vendor/stats",
+      authenticate,
+      requireRole("vendor"),
+      async (req, res) => {
+        const stats = await vendorStats(req.user.id);
+        res.json({
+          success: true,
+          data: {
+            ...stats,
+            subscriptionPlan: req.user.subscriptionPlan ?? "free",
+            subscriptionExpiresAt: req.user.subscriptionExpiresAt ?? null,
+          },
+        });
+      },
+    );
+
+    app.get(
+      "/api/customer/stats",
+      authenticate,
+      requireRole("customer"),
+      async (req, res) => {
+        res.json({
+          success: true,
+          data: await customerBookingStats(req.user.id),
+        });
+      },
+    );
+
     app.get(
       "/api/admin/stats",
       authenticate,
@@ -1028,6 +1224,27 @@ app.get("/api/services/meta", (req, res) => {
           success: true,
           data: { id: req.params.id, isBlocked: blocked },
           message: blocked ? "User blocked" : "User unblocked",
+        });
+      },
+    );
+
+    app.patch(
+      "/api/admin/users/:id/unblock",
+      authenticate,
+      requireRole("admin"),
+      async (req, res) => {
+        const user = await findUser(req.params.id);
+        if (!user)
+          return res
+            .status(404)
+            .json({ success: false, message: "User not found" });
+        await db.collection("user").updateOne(userQuery(req.params.id), {
+          $set: { isBlocked: false, updatedAt: new Date() },
+        });
+        res.json({
+          success: true,
+          data: { id: req.params.id, isBlocked: false },
+          message: "User unblocked",
         });
       },
     );
@@ -1443,7 +1660,6 @@ app.get("/api/services/meta", (req, res) => {
               message: "You cannot verify a payment for another vendor",
             });
 
-        // Preserve existing plan duration if user already has a plan that expires later
         const existingUser = await findUser(vendorId);
         const existingExpiresAt = existingUser.subscriptionExpiresAt
           ? new Date(existingUser.subscriptionExpiresAt)
@@ -1512,7 +1728,6 @@ app.get("/api/services/meta", (req, res) => {
           object.metadata?.vendorId || object.client_reference_id;
         const planType = "premium";
         if (vendorId) {
-          // Preserve existing plan duration if user already has a plan that expires later
           const existingUser = await findUser(vendorId);
           const existingExpiresAt = existingUser.subscriptionExpiresAt
             ? new Date(existingUser.subscriptionExpiresAt)
@@ -1587,13 +1802,10 @@ app.get("/api/services/meta", (req, res) => {
 
     async function seedSampleData() {
       const now = new Date();
-
-      // Check if sample data has already been seeded — prevent re-creation after deletion
       const existingConfig = await db
         .collection("config")
         .findOne({ _id: "sampleData" });
       if (existingConfig && existingConfig.seeded) {
-        // Sample data already seeded; ensure vendor/customer IDs are still available
         const vendor = await db
           .collection("user")
           .findOne({ email: "sample-vendor@wedplan.test" });
@@ -1601,10 +1813,7 @@ app.get("/api/services/meta", (req, res) => {
           .collection("user")
           .findOne({ email: "sample.customer@wedplan.app" });
         if (!vendor || !customer) {
-          // Config says seeded but users are missing — re-seed them
-          // Fall through to re-creation below
         } else {
-          // Users exist and config is set — we're done; still need to ensure services/bookings
           const sampleService = await db
             .collection("services")
             .findOne({ vendorId: vendor._id, status: "approved" });
@@ -1658,7 +1867,7 @@ app.get("/api/services/meta", (req, res) => {
         vendorId = String(vendor._id ?? vendor.id);
       }
 
-      // catalog entry that is missing from the marketplace ---
+     
       const catalogDocs = await serviceCatalog.find().toArray();
       const existingServiceNames = new Set(
         (
@@ -1774,6 +1983,22 @@ app.get("/api/services/meta", (req, res) => {
         });
       console.log(`Admin ensured for ${email}`);
     }
+
+   
+    app.use("/api", (req, res) =>
+      res.status(404).json({
+        success: false,
+        message: `Endpoint not found: ${req.method} ${req.originalUrl}`,
+      }),
+    );
+
+    app.use((err, _req, res, _next) => {
+      console.error("[server] request error:", err);
+      res.status(500).json({
+        success: false,
+        message: "Internal server error",
+      });
+    });
 
     async function main() {
       if (process.argv.includes("--seed")) {
