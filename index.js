@@ -2001,6 +2001,10 @@ app.get("/api/services/meta", (req, res) => {
     }
 
    
+    app.get("/api/health", (_req, res) => {
+      res.json({ success: true, status: "ok" });
+    });
+
     app.use("/api", (req, res) =>
       res.status(404).json({
         success: false,
