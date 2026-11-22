@@ -23,6 +23,11 @@ app.use(
   }),
 );
 
+app.use((req, res, next) => {
+  console.log(`[server] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
 const client = new MongoClient(
   `mongodb+srv://${process.env.MONGODB_USER}:${process.env.MONGODB_PASS}@cluster0.cejh16o.mongodb.net/`,
 );
