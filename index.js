@@ -57,8 +57,11 @@ const serviceCatalog = db.collection("serviceCatalog");
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+const BETTER_AUTH_BASE_URL = (
+  process.env.BETTER_AUTH_URL || "http://localhost:3000"
+).replace(/\/+$/, "");
 const JWT_JWKS_URL =
-  process.env.JWKS_URL || "http://localhost:3000/api/auth/jwks";
+  process.env.JWKS_URL || `${BETTER_AUTH_BASE_URL}/api/auth/jwks`;
 
 async function verifyJwt(token) {
   const parts = String(token).split(".");
@@ -1514,8 +1517,8 @@ app.post(
     const vendorId = String(req.user.id);
     const planType = req.body.planType || "premium";
     const planKey = "premium";
-    const success_url = `http://localhost:3000/payment/success?session_id={CHECKOUT_SESSION_ID}`;
-    const cancel_url = `http://localhost:3000/payment/cancel`;
+    const success_url = `${BETTER_AUTH_BASE_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`;
+    const cancel_url = `${BETTER_AUTH_BASE_URL}/payment/cancel`;
     const params = {
       mode: stripeConfig.priceId ? "subscription" : "payment",
       success_url: success_url,
