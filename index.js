@@ -10,7 +10,13 @@ const port = process.env.PORT || 5000;
 
 app.use(cors());
 
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
 
 const client = new MongoClient(
   `mongodb+srv://${process.env.MONGODB_USER}:${process.env.MONGODB_PASS}@cluster0.cejh16o.mongodb.net/`,
@@ -1705,12 +1711,12 @@ app.get("/api/services/meta", (req, res) => {
     );
 
     async function handleStripeWebhook(req, res) {
-      if (!Buffer.isBuffer(req.body))
+      if (!Buffer.isBuffer(req.rawBody))
         return res
           .status(400)
           .json({ success: false, message: "Expected raw body" });
       try {
-        if (!verifyStripeSignature(req.body, req.headers["stripe-signature"])) {
+        if (!verifyStripeSignature(req.rawBody, req.headers["stripe-signature"])) {
           return res
             .status(400)
             .json({
@@ -1721,7 +1727,7 @@ app.get("/api/services/meta", (req, res) => {
       } catch (err) {
         return res.status(400).json({ success: false, message: err.message });
       }
-      const event = JSON.parse(req.body.toString("utf8"));
+      const event = JSON.parse(req.rawBody.toString("utf8"));
       const object = event?.data?.object ?? {};
       if (event.type === "checkout.session.completed") {
         const vendorId =
